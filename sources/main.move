@@ -1,181 +1,204 @@
 module ride_sharing::ride_sharing {
 
     // Imports
-    use sui::transfer;
-    use sui::sui::SUI;
-    use sui::coin::{Self, Coin};
-    use sui::object::{Self, UID};
-    use sui::balance::{Self, Balance};
-    use sui::tx_context::{Self, TxContext};
-    use std::option::{Option, none, some, is_some, contains, borrow};
+    use 0x1::P2P::P2P;
+    use 0x1::Account::Account;
+    use 0x1::LibraAccount::LibraAccount;
+    use 0x1::Coin::Coin;
+    use 0x1::Signer::Signer;
+    use 0x1::LibraCoin::LibraCoin;
+    use 0x1::Address::Address;
 
     // Errors
-    const EInvalidBid: u64 = 1;
-    const EInvalidRide: u64 = 2;
-    const EDispute: u64 = 3;
-    const EAlreadyResolved: u64 = 4;
-    const ENotDriver: u64 = 5;
-    const EInvalidWithdrawal: u64 = 7;
-    const EInvalidRating: u64 = 8;
-    const ENotRider: u64 = 9;
+    const E_INVALID_BID: u64 = 1;
+    const E_INVALID_RIDE: u64 = 2;
+    const E_DISPUTE: u64 = 3;
+    const E_ALREADY_RESOLVED: u64 = 4;
+    const E_NOT_DRIVER: u64 = 5;
+    const E_INVALID_WITHDRAWAL: u64 = 6;
+    const E_INVALID_RATING: u64 = 7;
+    const E_NOT_RIDER: u64 = 8;
+    const MAX_ESCROW_MULTIPLIER: u64 = 2;
 
     // Struct definitions
-    struct Ride has key, store {
-        id: UID,
+    struct Ride {
+        id: u64,
         rider: address,
         driver: Option<address>,
         destination: vector<u8>,
         price: u64,
-        escrow: Balance<SUI>,
-        rideCompleted: bool,
+        escrow: Coin<LibraCoin>,
+        ride_completed: bool,
         dispute: bool,
-        riderRating: Option<u8>, // Rating given by the rider (0-5)
-        driverRating: Option<u8>, // Rating given by the driver (0-5)
+        rider_rating: Option<u8>, // Rating given by the rider (0-5)
+        driver_rating: Option<u8>, // Rating given by the driver (0-5)
+        dispute_attempts: u64,
     }
 
     // Accessors
-    public entry fun get_ride_destination(ride: &Ride): vector<u8> {
+    public fun get_ride_destination(ride: &Ride): vector<u8> {
         ride.destination
     }
 
-    public entry fun get_ride_price(ride: &Ride): u64 {
+    public fun get_ride_price(ride: &Ride): u64 {
         ride.price
     }
 
     // Public - Entry functions
-    public entry fun request_ride(destination: vector<u8>, price: u64, ctx: &mut TxContext) {
-        
-        let ride_id = object::new(ctx);
-        transfer::share_object(Ride {
+    public fun request_ride(destination: vector<u8>, price: u64, ctx: &mut Signer) {
+        let ride_id = P2P::random();
+        let ride = Ride {
             id: ride_id,
-            rider: tx_context::sender(ctx),
-            driver: none(),
+            rider: ctx.get_address(),
+            driver: None,
             destination: destination,
             price: price,
-            escrow: balance::zero(),
-            rideCompleted: false,
+            escrow: Coin::new(0),
+            ride_completed: false,
             dispute: false,
-            riderRating: none(),
-            driverRating: none(),
-        });
+            rider_rating: None,
+            driver_rating: None,
+            dispute_attempts: 0,
+        };
+        P2P::save(ride_id, ride);
     }
 
-    public entry fun accept_ride(ride: &mut Ride, ctx: &mut TxContext) {
-        assert!(!is_some(&ride.driver), EInvalidBid);
-        ride.driver = some(tx_context::sender(ctx));
+    public fun accept_ride(ride_id: u64, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(!ride.driver.exists(), E_INVALID_BID);
+        ride.driver = Some(ctx.get_address());
     }
 
-    public entry fun complete_ride(ride: &mut Ride, ctx: &mut TxContext) {
-        assert!(contains(&ride.driver, &tx_context::sender(ctx)), EInvalidRide);
-        ride.rideCompleted = true;
+    public fun complete_ride(ride_id: u64, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(ride.driver.contains(ctx.get_address()), E_INVALID_RIDE);
+        ride.ride_completed = true;
     }
 
-    public entry fun dispute_ride(ride: &mut Ride, ctx: &mut TxContext) {
-        assert!(ride.rider == tx_context::sender(ctx), EDispute);
+    public fun dispute_ride(ride_id: u64, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(ride.rider == ctx.get_address(), E_DISPUTE);
         ride.dispute = true;
     }
 
-    public entry fun resolve_dispute(ride: &mut Ride, resolved: bool, ctx: &mut TxContext) {
-        assert!(ride.rider == tx_context::sender(ctx), EDispute);
-        assert!(ride.dispute, EAlreadyResolved);
-        assert!(is_some(&ride.driver), EInvalidBid);
-        let escrow_amount = balance::value(&ride.escrow);
-        let escrow_coin = coin::take(&mut ride.escrow, escrow_amount, ctx);
-        if (resolved) {
-            let driver = *borrow(&ride.driver);
+    public fun resolve_dispute(ride_id: u64, resolved: bool, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(ride.rider == ctx.get_address(), E_DISPUTE);
+        assert!(ride.dispute, E_ALREADY_RESOLVED);
+        assert!(ride.driver.exists(), E_INVALID_BID);
+
+        let escrow_amount = ride.escrow.value();
+        let escrow_coin = ride.escrow.take(escrow_amount);
+
+        if resolved {
             // Transfer funds to the driver
-            transfer::public_transfer(escrow_coin, driver);
+            P2P::transfer_coins(escrow_coin, ride.driver.unwrap());
         } else {
             // Refund funds to the rider
-            transfer::public_transfer(escrow_coin, ride.rider);
-        };
+            P2P::transfer_coins(escrow_coin, ride.rider);
+        }
 
         // Reset ride state
-        ride.driver = none();
-        ride.rideCompleted = false;
+        ride.driver = None;
+        ride.ride_completed = false;
         ride.dispute = false;
+        ride.dispute_attempts = 0;
     }
 
-    public entry fun release_payment(ride: &mut Ride, ctx: &mut TxContext) {
-        assert!(ride.rider == tx_context::sender(ctx), ENotDriver);
-        assert!(ride.rideCompleted && !ride.dispute, EInvalidRide);
-        assert!(is_some(&ride.driver), EInvalidBid);
-        let driver = *borrow(&ride.driver);
-        let escrow_amount = balance::value(&ride.escrow);
-        let escrow_coin = coin::take(&mut ride.escrow, escrow_amount, ctx);
+    public fun release_payment(ride_id: u64, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(ride.rider == ctx.get_address(), E_NOT_DRIVER);
+        assert!(ride.ride_completed && !ride.dispute, E_INVALID_RIDE);
+        assert!(ride.driver.exists(), E_INVALID_BID);
+
+        let escrow_amount = ride.escrow.value();
+        let escrow_coin = ride.escrow.take(escrow_amount);
+
         // Transfer funds to the driver
-        transfer::public_transfer(escrow_coin, driver);
+        P2P::transfer_coins(escrow_coin, ride.driver.unwrap());
 
         // Reset ride state
-        ride.driver = none();
-        ride.rideCompleted = false;
+        ride.driver = None;
+        ride.ride_completed = false;
         ride.dispute = false;
     }
 
     // Additional functions
-    public entry fun cancel_ride(ride: &mut Ride, ctx: &mut TxContext) {
-        assert!(ride.rider == tx_context::sender(ctx) || contains(&ride.driver, &tx_context::sender(ctx)), ENotDriver);
-        
+    public fun cancel_ride(ride_id: u64, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(ride.rider == ctx.get_address() || ride.driver.contains(ctx.get_address()), E_NOT_DRIVER);
+
         // Refund funds to the rider if not yet paid
-        if (is_some(&ride.driver) && !ride.rideCompleted && !ride.dispute) {
-            let escrow_amount = balance::value(&ride.escrow);
-            let escrow_coin = coin::take(&mut ride.escrow, escrow_amount, ctx);
-            transfer::public_transfer(escrow_coin, ride.rider);
-        };
+        if ride.driver.exists() && !ride.ride_completed && !ride.dispute {
+            let escrow_amount = ride.escrow.value();
+            let escrow_coin = ride.escrow.take(escrow_amount);
+            P2P::transfer_coins(escrow_coin, ride.rider);
+        }
 
         // Reset ride state
-        ride.driver = none();
-        ride.rideCompleted = false;
+        ride.driver = None;
+        ride.ride_completed = false;
         ride.dispute = false;
+        ride.dispute_attempts = 0;
     }
 
-    public entry fun update_ride_destination(ride: &mut Ride, new_destination: vector<u8>, ctx: &mut TxContext) {
-        assert!(ride.rider == tx_context::sender(ctx), ENotDriver);
+    public fun update_ride_destination(ride_id: u64, new_destination: vector<u8>, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(ride.rider == ctx.get_address(), E_NOT_DRIVER);
         ride.destination = new_destination;
     }
 
-    public entry fun update_ride_price(ride: &mut Ride, new_price: u64, ctx: &mut TxContext) {
-        assert!(ride.rider == tx_context::sender(ctx), ENotDriver);
+    public fun update_ride_price(ride_id: u64, new_price: u64, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(ride.rider == ctx.get_address(), E_NOT_DRIVER);
+        assert!(new_price >= 0, E_INVALID_WITHDRAWAL);
         ride.price = new_price;
     }
 
     // New functions
-    public entry fun add_funds_to_ride(ride: &mut Ride, amount: Coin<SUI>, ctx: &mut TxContext) {
-        assert!(tx_context::sender(ctx) == ride.rider, ENotDriver);
-        let added_balance = coin::into_balance(amount);
-        balance::join(&mut ride.escrow, added_balance);
+    public fun add_funds_to_ride(ride_id: u64, amount: u64, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(ride.rider == ctx.get_address(), E_NOT_DRIVER);
+        assert!(ride.escrow.value() + amount <= ride.price * MAX_ESCROW_MULTIPLIER, E_INVALID_WITHDRAWAL);
+        ride.escrow = ride.escrow.join(amount);
     }
 
-    public entry fun request_refund(ride: &mut Ride, ctx: &mut TxContext) {
-        assert!(tx_context::sender(ctx) == ride.rider, ENotDriver);
-        assert!(ride.rideCompleted == false, EInvalidWithdrawal);
-        let escrow_amount = balance::value(&ride.escrow);
-        let escrow_coin = coin::take(&mut ride.escrow, escrow_amount, ctx);
+    public fun request_refund(ride_id: u64, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(ride.rider == ctx.get_address(), E_NOT_DRIVER);
+        assert!(!ride.ride_completed, E_INVALID_WITHDRAWAL);
+
+        let escrow_amount = ride.escrow.value();
+        let escrow_coin = ride.escrow.take(escrow_amount);
         // Refund funds to the rider
-        transfer::public_transfer(escrow_coin, ride.rider);
+        P2P::transfer_coins(escrow_coin, ride.rider);
 
         // Reset ride state
-        ride.driver = none();
-        ride.rideCompleted = false;
+        ride.driver = None;
+        ride.ride_completed = false;
         ride.dispute = false;
+        ride.dispute_attempts = 0;
     }
 
-    public entry fun mark_ride_complete(ride: &mut Ride, ctx: &mut TxContext) {
-        assert!(contains(&ride.driver, &tx_context::sender(ctx)), ENotDriver);
-        ride.rideCompleted = true;
+    public fun mark_ride_complete(ride_id: u64, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(ride.driver.contains(ctx.get_address()), E_NOT_DRIVER);
+        ride.ride_completed = true;
     }
 
-    public entry fun rateDriver(ride: &mut Ride, rating: u8, ctx: &mut TxContext) {
-        assert!(contains(&ride.driver, &tx_context::sender(ctx)), ENotDriver);
-        assert!(ride.rideCompleted && !ride.dispute, EInvalidRide);
-        assert!(rating >= 0 && rating <= 5, EInvalidRating);
-        ride.driverRating = some(rating);
+    public fun rate_driver(ride_id: u64, rating: u8, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(ride.driver.contains(ctx.get_address()), E_NOT_DRIVER);
+        assert!(ride.ride_completed && !ride.dispute, E_INVALID_RIDE);
+        assert!(rating <= 5, E_INVALID_RATING);
+        ride.driver_rating = Some(rating);
     }
 
-    public entry fun rateRider(ride: &mut Ride, rating: u8, ctx: &mut TxContext) {
-        assert!(ride.rider == tx_context::sender(ctx), ENotRider);
-        assert!(ride.rideCompleted && !ride.dispute, EInvalidRide);
-        assert!(rating >= 0 && rating <= 5, EInvalidRating);
-        ride.riderRating = some(rating);
+    public fun rate_rider(ride_id: u64, rating: u8, ctx: &mut Signer) {
+        let mut ride = P2P::borrow_mut(ride_id);
+        assert!(ride.rider == ctx.get_address(), E_NOT_RIDER);
+        assert!(ride.ride_completed && !ride.dispute, E_INVALID_RIDE);
+        assert!(rating <= 5, E_INVALID_RATING);
+        ride.rider_rating = Some(rating);
     }
 }
